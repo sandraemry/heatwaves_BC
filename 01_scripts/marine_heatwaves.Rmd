@@ -1,0 +1,898 @@
+---
+title: "marine heatwave metrics"
+author: "Sandra Emry"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load libraries}
+library(terra)
+library(tidyverse)
+library(ncdf4)
+library(arrow)
+library(sf)
+library(exactextractr)
+library(data.table)
+```
+This code will produce a variety of marine heatwave metrics for a given area. To first describe the climatology of the area, it uses the [OSTIA](https://doi.org/10.48670/moi-00165) global foundation Sea Surface Temperature product, a daily 0.05° by 0.05° (~ 6km) horizontal grid resolution, using in-situ and satellite data from both infrared and microwave radiometers. OSTIA is used to calculate the 90th percentile of SST over 30 years. Here it uses 1990-2019, but this can be changed depending on user preference. These data are downloaded in the 'download_ostia.py' script. 
+
+The Multi-scale Ultra-high Resolution (MUR) from NASA produces 'A Group for High Resolution Sea Surface Temperature [(GHRSST)](https://doi.org/10.5067/GHGMR-4FJ04 )' dataset at a daily, global 0.01 by 0.01 degree grid (~1km). This data is downloaded in the 'subset_mur_bc_yearly.py' script. This data goes back to 2002, which is why we are using OSTIA for the 30 year climatology. 
+
+To resolve heatwave metrics to a finer spatial scale, we resample the 90th percentile metric to the MUR grid using bilinear interpolation. 
+
+Define AOI: replace with your bounding box 
+```{r define AOI}
+aoi <- ext(-133.5, -121.0, 47.5, 54.5)
+```
+
+### Build 30 year daily climatology (1990-2019) from OSTIA
+[Global Ocean OSTIA Sea Surface Temperature](https://doi.org/10.48670/moi-00165)
+- Compute a daily climatology by day-of-year (DOY), so that I can calculate a 'days above historical average'
+- Each OSTIA daily file contains SST in kelvin
+- Create DOY 90th percentile rasters (11 day window to smooth out noise)
+
+Build an index of (file, time_index, date)
+```{r climatology step 1}
+
+baseline_start <- ymd("1990-01-01")
+baseline_end   <- ymd("2019-12-31")
+window <- 5       # use 5 for an 11-day window (±5). 
+p <- 0.9
+varname <- "analysed_sst"
+
+ostia_files <- list.files("./00_data/ostia", pattern="\\.nc$", full.names=TRUE, recursive=TRUE)
+
+# Read time axis -> Date vector for a given file
+get_time_dates <- function(nc_path) {
+  nc <- ncdf4::nc_open(nc_path)
+  on.exit(ncdf4::nc_close(nc), add = TRUE)
+
+  # Time dimension name (usually "time")
+  tname <- if ("time" %in% names(nc$dim)) "time" else {
+    nm <- names(nc$dim)[grepl("time", names(nc$dim), ignore.case = TRUE)]
+    if (length(nm) == 0) stop("No time dim found in: ", nc_path)
+    nm[1]
+  }
+
+  tvals <- ncdf4::ncvar_get(nc, tname)
+  tunits <- nc$dim[[tname]]$units
+
+  origin_str <- sub("^.*since\\s+", "", tunits)
+  origin_str <- sub("\\s+UTC$", "", origin_str)
+  origin <- as.POSIXct(origin_str, tz = "UTC")
+
+  if (grepl("^days", tunits)) {
+    dt <- origin + tvals * 86400
+  } else if (grepl("^hours", tunits)) {
+    dt <- origin + tvals * 3600
+  } else if (grepl("^seconds", tunits)) {
+    dt <- origin + tvals
+  } else {
+    stop("Unsupported time units: ", tunits)
+  }
+
+  as.Date(dt)
+}
+
+
+```
+
+Build idx as (file, layer/time index, date, doy)
+```{r climatology step 2}
+
+# Build index: one row per time slice per file
+idx_list <- lapply(ostia_files, function(f) {
+  dates <- get_time_dates(f)
+  data.table(
+    file = f,
+    t_index = seq_along(dates),
+    date = dates
+  )
+})
+
+idx <- rbindlist(idx_list, use.names = TRUE, fill = TRUE)
+
+# Filter baseline window + add DOY
+idx <- idx[date >= baseline_start & date <= baseline_end]
+idx[, doy := yday(date)]
+
+```
+
+Build a MUR template raster (1 km grid) so that we can regrid the OSTIA data to match
+
+```{r climatology step 3 - MUR template raster}
+mur_template <- rast(
+  "00_data/mur/202001/146016225_20200101090000-JPL-L4_GHRSST-SSTfnd-MUR-GLOB-v02.0-fv04_analysed_sst_subsetted.nc4",
+  subds = "analysed_sst"
+)
+mur_template <- crop(mur_template, aoi)
+
+```
+
+Q90 loop using (file, t_index) pairs
+This step calculates the 90th percentile of SST on each day of the year 
+```{r climatology step 4 - Q90 raster}
+outdir_q90 <- "./02_outdata/climatology_ostia_doy_q90"
+dir.create(outdir_q90, recursive = TRUE, showWarnings = FALSE)
+
+wrap_doy <- function(d) ((d - 1) %% 366) + 1
+
+for (doy0 in 1:366) {
+  message("Q90 DOY: ", doy0)
+
+  # DOYs in window (±window)
+  doys <- wrap_doy((doy0 - window):(doy0 + window))
+
+  # Select (file, t_index) rows for those DOYs
+  sel <- idx[doy %in% doys, .(file, t_index)]
+  if (nrow(sel) == 0) next
+
+  # Split indices by file so we can read subsets efficiently
+  sel_split <- split(sel$t_index, sel$file)
+
+  # Read only selected layers from each file, crop, convert to °C
+  layers <- lapply(names(sel_split), function(f) {
+    r <- rast(f, subds = varname)[[ sel_split[[f]] ]]
+    r <- r - 273.15
+    crop(r, aoi)
+  })
+
+  # Combine into one multilayer SpatRaster
+  s <- do.call(c, layers)
+
+  # Compute per-pixel 90th percentile across layers
+  q90 <- app(s, fun = function(v) {
+    quantile(v, probs = p, na.rm = TRUE, type = 7)
+  })
+
+  writeRaster(
+    q90,
+    filename = file.path(outdir_q90, sprintf("ostia_q90_doy%03d.tif", doy0)),
+    overwrite = TRUE
+  )
+
+  rm(s, q90, layers, sel, sel_split)
+  gc()
+}
+
+```
+
+# resample Q90 thresholds to the MUR grid 
+The q90_ostia rasters are on the OSTIA grid (coarser, different pixel alignment). We will resample to align these historical thresholds to the mur grid, so that we can have a higher spatial resolution. 
+This step creates a threshold raster (q90_on_mur) with the same nrow/ncol, resolution, extent, CRS as MUR SST rasters used in the next step. 
+```{r climatology step 5 - resample to MUR grid}
+
+q90_dir <- "02_outdata/climatology_ostia_doy_q90"
+out_q90_mur_dir <- "02_outdata/climatology_mur_doy_q90"
+dir.create(out_q90_mur_dir, recursive=TRUE, showWarnings=FALSE)
+
+for (doy in 1:366) {
+  f <- file.path(q90_dir, sprintf("ostia_q90_doy%03d.tif", doy))
+  if (!file.exists(f)) next
+
+  q90_ostia <- rast(f)
+  q90_on_mur <- resample(q90_ostia, mur_template, method="bilinear")
+
+  writeRaster(
+    q90_on_mur,
+    filename = file.path(out_q90_mur_dir, sprintf("climatology_mur_doy_q90%03d.tif", doy)),
+    overwrite = TRUE
+  )
+
+  rm(q90_ostia, q90_on_mur)
+  gc()
+}
+```
+
+### Identifying marine heatwaves (at least 5 consecutive exceedance days per year)
+The following code builds yearly marine heatwave rasters for 2020–2025 from daily summer SST data.
+
+For each day in June–September, it:
+
+- reads the daily MUR SST raster
+- reads the matching day-of-year 90th percentile threshold raster derived from the OSTIA climatology
+- identifies pixels where SST exceeds the threshold
+- calculates the daily anomaly above the threshold
+
+For each pixel, it tracks consecutive exceedance runs through the summer. A marine heatwave is defined as a run of at least 5 consecutive days where SST is above the threshold. When a run ends, the code records whether it qualified as a heatwave and updates yearly summaries for that pixel.
+
+The yearly output rasters are:
+
+mhw_eventmask_YYYY.tif: whether at least one marine heatwave occurred
+
+mhw_eventcount_YYYY.tif: number of marine heatwave events
+
+mhw_maxrun_YYYY.tif: duration of the longest marine heatwave
+
+mhw_eventdays_YYYY.tif: total number of days spent in marine heatwaves
+
+mhw_maxmean_intensity_YYYY.tif: highest mean anomaly among events that year
+
+mhw_meanmean_intensity_YYYY.tif: average of the event-mean anomalies that year
+
+Maximum mean event intensity per year (Jun–Sep)
+
+Output: 
+mhw_maxmean_intensity_YYYY.tif = for each pixel, the maximum (across events in that summer) of:
+1. Define an event = a consecutive exceedance run where SST > Q90 for ≥ 5 days
+2. Intensity = anomaly above Q90: anom = SST − Q90 (°C)
+3. For each event, compute mean anomaly across all days in the event 
+4. Output per year: maximum of those event-mean anomalies (“max mean event intensity”)
+
+```{r Step 6: MHW metric calculations}
+
+mur_root <- "00_data/mur"
+mur_var  <- "analysed_sst"
+q90_dir  <- "02_outdata/climatology_mur_doy_q90"
+
+out_dir_mask <- "02_outdata/mhw_eventmask"
+out_dir_maxrun <- "02_outdata/mhw_maxrun"
+out_dir_eventdays <- "02_outdata/mhw_eventdays"
+out_dir_eventcount <- "02_outdata/mhw_eventcount"
+out_dir_maxint <- "02_outdata/mhw_maxmean_intensity"
+out_dir_meanint <- "02_outdata/mhw_meanmean_intensity"
+
+dir.create(out_dir_mask, recursive = TRUE, showWarnings = FALSE)
+dir.create(out_dir_maxrun, recursive = TRUE, showWarnings = FALSE)
+dir.create(out_dir_eventdays, recursive = TRUE, showWarnings = FALSE)
+dir.create(out_dir_eventcount, recursive = TRUE, showWarnings = FALSE)
+dir.create(out_dir_maxint, recursive = TRUE, showWarnings = FALSE)
+dir.create(out_dir_meanint, recursive = TRUE, showWarnings = FALSE)
+
+#  list files + parse datetimes 
+all_files <- list.files(mur_root, pattern = "\\.nc4$", full.names = TRUE, recursive = TRUE)
+
+ts_chr <- str_match(basename(all_files), "_(\\d{14})-")[, 2]
+dts <- parse_date_time(ts_chr, orders = "YmdHMS", tz = "UTC")
+
+keep <- !is.na(dts) &
+  dts >= ymd_hms("2020-01-01 00:00:00", tz = "UTC") &
+  dts <= ymd_hms("2025-12-31 23:59:59", tz = "UTC")
+
+mur_files <- all_files[keep]
+dts <- dts[keep]
+
+if (length(mur_files) == 0) {
+  stop("No MUR files found for 2020–2025 in ", mur_root)
+}
+
+ord <- order(dts)
+mur_files <- mur_files[ord]
+dts <- dts[ord]
+
+years <- 2020:2025
+
+# finalize any active events ----
+finalize_active_events <- function(run_len, anom_sum,
+                                   eventcount, eventdays,
+                                   maxmean_intensity,
+                                   event_mean_sum, event_mean_n) {
+  
+  # valid ended/current event = active run is at least 5 days
+  valid_event <- run_len >= 5
+  
+  # mean anomaly for the event; force 0 where not a valid event
+  event_mean <- ifel(valid_event, anom_sum / run_len, 0)
+  
+  # update outputs
+  eventcount <- eventcount + ifel(valid_event, 1, 0)
+  eventdays  <- eventdays  + ifel(valid_event, run_len, 0)
+  
+  maxmean_intensity <- ifel(
+    valid_event & (is.na(maxmean_intensity) | event_mean > maxmean_intensity),
+    event_mean,
+    maxmean_intensity
+  )
+  
+  event_mean_sum <- event_mean_sum + ifel(valid_event, event_mean, 0)
+  event_mean_n   <- event_mean_n   + ifel(valid_event, 1, 0)
+  
+  list(
+    eventcount = eventcount,
+    eventdays = eventdays,
+    maxmean_intensity = maxmean_intensity,
+    event_mean_sum = event_mean_sum,
+    event_mean_n = event_mean_n
+  )
+}
+
+for (yy in years) {
+  
+  message("Processing year ", yy)
+  
+ # keep only Jun-Sep for this year (might change this eventually)
+  keep_year <- year(dts) == yy &
+    month(dts) >= 6 &
+    month(dts) <= 9
+  
+  mur_files_year <- mur_files[keep_year]
+  dts_year <- as.Date(dts[keep_year])
+  
+  template <- rast(mur_files_year[1], subds = mur_var)
+  
+  #active-run state
+  run_len  <- template; values(run_len)  <- 0   # current consecutive exceedance run length
+  anom_sum <- template; values(anom_sum) <- 0   # cumulative anomaly during current run
+  
+  #  yearly output rasters 
+  eventcount <- template; values(eventcount) <- 0
+  maxrun     <- template; values(maxrun)     <- 0
+  eventdays  <- template; values(eventdays)  <- 0
+  
+  # event-mean intensity summaries
+  maxmean_intensity <- template; values(maxmean_intensity) <- NA
+  event_mean_sum    <- template; values(event_mean_sum)    <- 0
+  event_mean_n      <- template; values(event_mean_n)      <- 0
+  
+  prev_date <- as.Date(NA)
+  
+  for (i in seq_along(mur_files_year)) {
+    
+    this_date <- dts_year[i]
+    
+    #  if a day is missing, finalize any active events first
+    if (!is.na(prev_date) && as.integer(this_date - prev_date) > 1) {
+      
+      out <- finalize_active_events(
+        run_len, anom_sum,
+        eventcount, eventdays,
+        maxmean_intensity,
+        event_mean_sum, event_mean_n
+      )
+      
+      eventcount        <- out$eventcount
+      eventdays         <- out$eventdays
+      maxmean_intensity <- out$maxmean_intensity
+      event_mean_sum    <- out$event_mean_sum
+      event_mean_n      <- out$event_mean_n
+      
+      values(run_len)  <- 0
+      values(anom_sum) <- 0
+    }
+    
+    prev_date <- this_date
+    
+    #  read MUR 
+    mur <- rast(mur_files_year[i], subds = mur_var)
+    
+    mur_rng <- global(mur, "range", na.rm = TRUE)
+    if (is.finite(mur_rng[1, 2]) && mur_rng[1, 2] > 100) {
+      mur <- mur - 273.15
+    }
+    
+    # read threshold
+    doy <- yday(this_date)
+    thr_path <- file.path(q90_dir, sprintf("climatology_mur_doy_q90%03d.tif", doy))
+    
+    if (!file.exists(thr_path)) next
+    
+    thr <- rast(thr_path)
+    
+    thr_rng <- global(thr, "range", na.rm = TRUE)
+    if (is.finite(thr_rng[1, 2]) && thr_rng[1, 2] > 100) {
+      thr <- thr - 273.15
+    }
+    
+    # align threshold to MUR if needed 
+    if (!compareGeom(mur, thr, stopOnError = FALSE)) {
+      if (!same.crs(mur, thr)) {
+        thr <- project(thr, mur)
+      }
+      thr <- resample(thr, mur, method = "bilinear")
+    }
+    
+    # exceedance and anomaly 
+    exceed <- ifel(is.na(mur) | is.na(thr), 0, mur > thr)
+    anom   <- ifel(exceed == 1, mur - thr, 0)
+    
+    # runs that end today 
+    # these cells were in a run yesterday, but are not exceeding today
+    ended_today <- (exceed == 0) & (run_len > 0)
+    
+    # finalize only those runs
+    ended_run_len  <- ifel(ended_today, run_len, 0)
+    ended_anom_sum <- ifel(ended_today, anom_sum, 0)
+    
+    valid_ended_event <- ended_run_len >= 5
+    ended_event_mean  <- ifel(valid_ended_event, ended_anom_sum / ended_run_len, 0)
+    
+    eventcount <- eventcount + ifel(valid_ended_event, 1, 0)
+    eventdays  <- eventdays  + ifel(valid_ended_event, ended_run_len, 0)
+    
+    maxmean_intensity <- ifel(
+      valid_ended_event & (is.na(maxmean_intensity) | ended_event_mean > maxmean_intensity),
+      ended_event_mean,
+      maxmean_intensity
+    )
+    
+    event_mean_sum <- event_mean_sum + ifel(valid_ended_event, ended_event_mean, 0)
+    event_mean_n   <- event_mean_n   + ifel(valid_ended_event, 1, 0)
+    
+    #  update active run state for today 
+    run_len  <- ifel(exceed == 1, run_len + 1, 0)
+    anom_sum <- ifel(exceed == 1, anom_sum + anom, 0)
+    
+    # longest run seen this year
+    maxrun <- ifel(run_len > maxrun, run_len, maxrun)
+    
+    rm(mur, thr, exceed, anom, ended_today, ended_run_len,
+       ended_anom_sum, valid_ended_event, ended_event_mean)
+    gc()
+  }
+  
+  # finalize events still active on the last available day 
+  out <- finalize_active_events(
+    run_len, anom_sum,
+    eventcount, eventdays,
+    maxmean_intensity,
+    event_mean_sum, event_mean_n
+  )
+  
+  eventcount        <- out$eventcount
+  eventdays         <- out$eventdays
+  maxmean_intensity <- out$maxmean_intensity
+  event_mean_sum    <- out$event_mean_sum
+  event_mean_n      <- out$event_mean_n
+  
+  # derive yearly summary rasters
+  eventmask <- ifel(eventcount > 0, 1, 0)
+  
+  # store only valid MHW lengths; set to 0 if no >=5-day event occurred
+  maxrun_out <- ifel(maxrun >= 5, maxrun, 0)
+  
+  # avoid 0/0 -> NaN
+  safe_n <- ifel(event_mean_n > 0, event_mean_n, 1)
+  meanmean_intensity <- ifel(event_mean_n > 0, event_mean_sum / safe_n, NA)
+  
+  ## Change if you want 0 instead of NA where no events occurred
+  # meanmean_intensity <- ifel(event_mean_n > 0, event_mean_sum / safe_n, 0)
+  # maxmean_intensity  <- ifel(eventcount > 0, maxmean_intensity, 0)
+  
+  # ---- write outputs ----
+  writeRaster(
+    eventmask,
+    file.path(out_dir_mask, paste0("mhw_eventmask_", yy, ".tif")),
+    overwrite = TRUE
+  )
+  
+  writeRaster(
+    eventcount,
+    file.path(out_dir_eventcount, paste0("mhw_eventcount_", yy, ".tif")),
+    overwrite = TRUE
+  )
+  
+  writeRaster(
+    maxrun_out,
+    file.path(out_dir_maxrun, paste0("mhw_maxrun_", yy, ".tif")),
+    overwrite = TRUE
+  )
+  
+  writeRaster(
+    eventdays,
+    file.path(out_dir_eventdays, paste0("mhw_eventdays_", yy, ".tif")),
+    overwrite = TRUE
+  )
+  
+  writeRaster(
+    maxmean_intensity,
+    file.path(out_dir_maxint, paste0("mhw_maxmean_intensity_", yy, ".tif")),
+    overwrite = TRUE
+  )
+  
+  writeRaster(
+    meanmean_intensity,
+    file.path(out_dir_meanint, paste0("mhw_meanmean_intensity_", yy, ".tif")),
+    overwrite = TRUE
+  )
+  
+  rm(template, run_len, anom_sum, eventcount, maxrun, eventdays,
+     maxmean_intensity, event_mean_sum, event_mean_n,
+     eventmask, maxrun_out, safe_n, meanmean_intensity, out)
+  gc()
+}
+
+```
+
+
+Look at one pixel, reconstruct the daily SST and threshold time series for that location, identify heatwave events manually, and compare those manually calculated summaries against the raster outputs.
+```{r looking at a single pixel }
+yy <- 2020
+mur_root <- "00_data/mur"
+mur_var  <- "analysed_sst"
+q90_dir  <- "02_outdata/climatology_mur_doy_q90"
+
+# list files + parse datetimes 
+all_files <- list.files(mur_root, pattern = "\\.nc4$", full.names = TRUE, recursive = TRUE)
+ts_chr <- str_match(basename(all_files), "_(\\d{14})-")[, 2]
+dts <- parse_date_time(ts_chr, orders = "YmdHMS", tz = "UTC")
+
+keep <- !is.na(dts) &
+  year(dts) == yy &
+  month(dts) >= 6 &
+  month(dts) <= 9
+
+mur_files_year <- all_files[keep]
+dts_year <- as.Date(dts[keep])
+
+ord <- order(dts_year)
+mur_files_year <- mur_files_year[ord]
+dts_year <- dts_year[ord]
+
+# click a point on one of the yearly rasters
+maxrun_r <- rast(file.path("02_outdata", paste0("mhw_maxrun_", yy, ".tif")))
+plot(maxrun_r)
+xy <- click(maxrun_r, xy = TRUE)
+
+# keep only x and y
+xy <- xy[, c("x", "y")]
+
+# extract daily SST and threshold at that point
+ts_list <- vector("list", length(mur_files_year))
+
+for (i in seq_along(mur_files_year)) {
+  this_date <- dts_year[i]
+  doy <- yday(this_date)
+
+  thr_path <- file.path(q90_dir, sprintf("climatology_mur_doy_q90%03d.tif", doy))
+  if (!file.exists(thr_path)) next
+
+  mur <- rast(mur_files_year[i], subds = mur_var)
+  mur_rng <- global(mur, "range", na.rm = TRUE)
+  if (is.finite(mur_rng[1, 2]) && mur_rng[1, 2] > 100) {
+    mur <- mur - 273.15
+  }
+
+  thr <- rast(thr_path)
+  thr_rng <- global(thr, "range", na.rm = TRUE)
+  if (is.finite(thr_rng[1, 2]) && thr_rng[1, 2] > 100) {
+    thr <- thr - 273.15
+  }
+
+  if (!compareGeom(mur, thr, stopOnError = FALSE)) {
+    if (!same.crs(mur, thr)) {
+      thr <- project(thr, mur)
+    }
+    thr <- resample(thr, mur, method = "bilinear")
+  }
+
+  mur_val <- extract(mur, xy)[1, 2]
+  thr_val <- extract(thr, xy)[1, 2]
+
+  ts_list[[i]] <- data.frame(
+    date = this_date,
+    mur = mur_val,
+    thr = thr_val
+  )
+}
+
+ts_list <- ts_list[!sapply(ts_list, is.null)]
+
+ts_df <- bind_rows(ts_list) %>%
+  arrange(date)
+
+# calculate exceedance/anomaly/run length
+ts_df$exceed <- ts_df$mur > ts_df$thr
+ts_df$anom <- ifelse(ts_df$exceed, ts_df$mur - ts_df$thr, 0)
+ts_df$run <- 0
+
+for (i in seq_len(nrow(ts_df))) {
+  if (!ts_df$exceed[i]) {
+    ts_df$run[i] <- 0
+  } else if (i == 1) {
+    ts_df$run[i] <- 1
+  } else if (as.integer(ts_df$date[i] - ts_df$date[i - 1]) == 1 && ts_df$exceed[i - 1]) {
+    ts_df$run[i] <- ts_df$run[i - 1] + 1
+  } else {
+    ts_df$run[i] <- 1
+  }
+}
+
+# assign event ids to consecutive exceedance runs
+ts_df$event_id <- NA_integer_
+event_counter <- 0
+
+for (i in seq_len(nrow(ts_df))) {
+  if (!ts_df$exceed[i]) next
+
+  if (i == 1) {
+    event_counter <- event_counter + 1
+    ts_df$event_id[i] <- event_counter
+  } else if (as.integer(ts_df$date[i] - ts_df$date[i - 1]) == 1 && ts_df$exceed[i - 1]) {
+    ts_df$event_id[i] <- event_counter
+  } else {
+    event_counter <- event_counter + 1
+    ts_df$event_id[i] <- event_counter
+  }
+}
+
+# summarize only valid MHW events (>= 5 days)
+event_tbl <- ts_df %>%
+  filter(exceed, !is.na(event_id)) %>%
+  group_by(event_id) %>%
+  summarise(
+    start_date = min(date),
+    end_date = max(date),
+    duration = n(),
+    mean_intensity = mean(anom, na.rm = TRUE),
+    max_intensity = max(anom, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(duration >= 5)
+
+event_tbl
+
+# summarize only valid MHW events (>= 5 days)
+event_tbl <- ts_df %>%
+  filter(exceed, !is.na(event_id)) %>%
+  group_by(event_id) %>%
+  summarise(
+    start_date = min(date),
+    end_date = max(date),
+    duration = n(),
+    mean_intensity = mean(anom, na.rm = TRUE),
+    max_intensity = max(anom, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(duration >= 5)
+
+event_tbl
+
+qa_summary <- data.frame(
+  year = yy,
+  eventmask = ifelse(nrow(event_tbl) > 0, 1, 0),
+  eventcount = nrow(event_tbl),
+  maxrun = ifelse(nrow(event_tbl) > 0, max(event_tbl$duration), 0),
+  eventdays = ifelse(nrow(event_tbl) > 0, sum(event_tbl$duration), 0),
+  maxmean_intensity = ifelse(nrow(event_tbl) > 0, max(event_tbl$mean_intensity), NA),
+  meanmean_intensity = ifelse(nrow(event_tbl) > 0, mean(event_tbl$mean_intensity), NA)
+)
+
+qa_summary
+
+r_eventmask <- rast(file.path(out_dir_mask, paste0("mhw_eventmask_", yy, ".tif")))
+r_eventcount <- rast(file.path(out_dir_eventcount, paste0("mhw_eventcount_", yy, ".tif")))
+r_maxrun <- rast(file.path(out_dir_maxrun, paste0("mhw_maxrun_", yy, ".tif")))
+r_eventdays <- rast(file.path(out_dir_eventdays, paste0("mhw_eventdays_", yy, ".tif")))
+r_maxmean <- rast(file.path(out_dir_maxint, paste0("mhw_maxmean_intensity_", yy, ".tif")))
+r_meanmean <- rast(file.path(out_dir_meanint, paste0("mhw_meanmean_intensity_", yy, ".tif")))
+
+raster_summary <- data.frame(
+  year = yy,
+  eventmask = extract(r_eventmask, xy)[1, 2],
+  eventcount = extract(r_eventcount, xy)[1, 2],
+  maxrun = extract(r_maxrun, xy)[1, 2],
+  eventdays = extract(r_eventdays, xy)[1, 2],
+  maxmean_intensity = extract(r_maxmean, xy)[1, 2],
+  meanmean_intensity = extract(r_meanmean, xy)[1, 2]
+)
+
+raster_summary
+
+comparison <- rbind(
+  manual = qa_summary[1, -1],
+  raster = raster_summary[1, -1]
+)
+
+comparison
+
+caption_txt <- sprintf("Location: %.4f°N, %.4f°W",
+                       xy$y, abs(xy$x))
+
+p <- ggplot(ts_df, aes(x = date)) +
+  geom_line(aes(y = mur), color = "indianred", linewidth = 1) +
+  geom_line(aes(y = thr, colour = "Q90 threshold"), color = "steelblue", linewidth = 1, linetype = "dashed") +
+  labs(
+    x = "Date",
+    y = "Temperature (°C)",
+    caption = caption_txt
+  ) +
+  theme_bw()
+
+if (nrow(event_tbl) > 0) {
+  
+  p <- p +
+    geom_rect(
+      data = event_tbl,
+      aes(xmin = start_date, xmax = end_date, ymin = -Inf, ymax = Inf),
+      inherit.aes = FALSE,
+      fill = "indianred",
+      alpha = 0.15
+    )
+}
+
+p
+```
+
+Combine rasters for all years that MHWs were calculated: 
+mhw_eventmask_allyears.tif: 1 if eventcount > 0 in any year
+
+mhw_eventcount_allyears.tif: sum of yearly event counts
+
+mhw_maxrun_allyears.tif: max of yearly maxrun
+
+mhw_eventdays_allyears.tif: sum of yearly eventdays
+
+mhw_maxmean_intensity_allyears.tif: max of yearly max-mean intensity
+
+mhw_meanmean_intensity_allyears.tif: weighted mean across years using yearly event counts as weights
+∑(yearly meanmean intensity × yearly eventcount) / ∑eventcount
+	​
+
+
+```{r}
+
+years <- 2020:2025
+
+# read yearly rasters
+eventmask_list <- lapply(years, function(y) {
+  rast(file.path(out_dir_mask, paste0("mhw_eventmask_", y, ".tif")))
+})
+
+eventcount_list <- lapply(years, function(y) {
+  rast(file.path(out_dir_eventcount, paste0("mhw_eventcount_", y, ".tif")))
+})
+
+maxrun_list <- lapply(years, function(y) {
+  rast(file.path(out_dir_maxrun, paste0("mhw_maxrun_", y, ".tif")))
+})
+
+eventdays_list <- lapply(years, function(y) {
+  rast(file.path(out_dir_eventdays, paste0("mhw_eventdays_", y, ".tif")))
+})
+
+maxmean_list <- lapply(years, function(y) {
+  rast(file.path(out_dir_maxint, paste0("mhw_maxmean_intensity_", y, ".tif")))
+})
+
+meanmean_list <- lapply(years, function(y) {
+  rast(file.path(out_dir_meanint, paste0("mhw_meanmean_intensity_", y, ".tif")))
+})
+
+# stack rasters
+eventmask_stack <- rast(eventmask_list)
+eventcount_stack <- rast(eventcount_list)
+maxrun_stack <- rast(maxrun_list)
+eventdays_stack <- rast(eventdays_list)
+maxmean_stack <- rast(maxmean_list)
+meanmean_stack <- rast(meanmean_list)
+
+# all-years outputs
+
+# 1. at least one event in any year
+mhw_eventmask_allyears <- ifel(app(eventcount_stack, sum, na.rm = TRUE) > 0, 1, 0)
+
+# 2. total number of events across all years
+mhw_eventcount_allyears <- app(eventcount_stack, sum, na.rm = TRUE)
+
+# 3. longest event in any year
+mhw_maxrun_allyears <- app(maxrun_stack, max, na.rm = TRUE)
+
+# 4. total event-days across all years
+mhw_eventdays_allyears <- app(eventdays_stack, sum, na.rm = TRUE)
+
+# 5. maximum event-mean intensity across all years
+mhw_maxmean_intensity_allyears <- app(maxmean_stack, max, na.rm = TRUE)
+
+# 6. mean of event-mean intensities across all years
+# weighted by yearly event counts
+weighted_sum <- app(meanmean_stack * eventcount_stack, sum, na.rm = TRUE)
+total_events <- app(eventcount_stack, sum, na.rm = TRUE)
+
+safe_total_events <- ifel(total_events > 0, total_events, 1)
+mhw_meanmean_intensity_allyears <- ifel(
+  total_events > 0,
+  weighted_sum / safe_total_events,
+  NA
+)
+
+# write outputs
+writeRaster(
+  mhw_eventmask_allyears,
+  file.path(out_dir, "mhw_eventmask_allyears.tif"),
+  overwrite = TRUE
+)
+
+writeRaster(
+  mhw_eventcount_allyears,
+  file.path(out_dir, "mhw_eventcount_allyears.tif"),
+  overwrite = TRUE
+)
+
+writeRaster(
+  mhw_maxrun_allyears,
+  file.path(out_dir, "mhw_maxrun_allyears.tif"),
+  overwrite = TRUE
+)
+
+writeRaster(
+  mhw_eventdays_allyears,
+  file.path(out_dir, "mhw_eventdays_allyears.tif"),
+  overwrite = TRUE
+)
+
+writeRaster(
+  mhw_maxmean_intensity_allyears,
+  file.path(out_dir, "mhw_maxmean_intensity_allyears.tif"),
+  overwrite = TRUE
+)
+
+writeRaster(
+  mhw_meanmean_intensity_allyears,
+  file.path(out_dir, "mhw_meanmean_intensity_allyears.tif"),
+  overwrite = TRUE
+)
+
+
+```
+
+```{r}
+
+plot_raster_gg <- function(r, title = NULL, fill_label = NULL) {
+
+  df <- as.data.frame(r, xy = TRUE, na.rm = FALSE)
+
+  value_name <- names(df)[3]
+
+  ggplot(df, aes(x = x, y = y, fill = .data[[value_name]])) +
+    geom_raster() +
+    coord_equal() +
+    scale_fill_viridis_c(na.value = "transparent") +
+    labs(
+      title = title,
+      fill = fill_label,
+      x = "Longitude",
+      y = "Latitude"
+    ) +
+    theme_bw()
+}
+
+eventmask <- rast("02_outdata/mhw_eventmask_allyears.tif")
+eventcount <- rast("02_outdata/mhw_eventcount_allyears.tif")
+maxrun <- rast("02_outdata/mhw_maxrun_allyears.tif")
+eventdays <- rast("02_outdata/mhw_eventdays_allyears.tif")
+maxmean <- rast("02_outdata/mhw_maxmean_intensity_allyears.tif")
+meanmean <- rast("02_outdata/mhw_meanmean_intensity_allyears.tif")
+
+plot_raster_gg(
+  eventmask,
+  "Marine Heatwave Occurrence (Any Year)",
+  "Event Mask"
+)
+
+plot_raster_gg(
+  eventcount,
+  "Number of Marine Heatwaves (2020–2025)",
+  "Event Count"
+)
+
+plot_raster_gg(
+  maxrun,
+  "Longest Marine Heatwave Duration (days)",
+  "Max Run"
+)
+
+plot_raster_gg(
+  eventdays,
+  "Total Marine Heatwave Days (2020–2025)",
+  "Event Days"
+)
+
+plot_raster_gg(
+  maxmean,
+  "Maximum Event Mean Intensity (°C above Q90)",
+  "Max Mean Intensity"
+)
+
+df <- as.data.frame(meanmean, xy = TRUE)
+ggplot(df, aes(x = x, y = y, fill = sum)) +
+  geom_raster() +
+  coord_equal() +
+  scale_fill_viridis_c() +
+  theme_bw()
+```
